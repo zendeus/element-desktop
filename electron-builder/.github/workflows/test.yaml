@@ -1,0 +1,531 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+      - release/v*
+  pull_request:
+  workflow_call:
+    inputs:
+      rebuild-docker-images-call:
+        description: "Force rebuild of Docker images?"
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      rebuild-docker-images:
+        description: "Force rebuild of Docker images?"
+        required: false
+        type: boolean
+        default: false
+      reset-vitest-smart-cache:
+        description: "Reset Vitest smart cache (will cause all tests to run without caching for this run, then cache will be repopulated for future runs)"
+        required: false
+        type: boolean
+        default: false
+
+# concurrency:
+# group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+# cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TEST_IMAGE_NODE_MAJOR_VERSION: 22
+
+jobs:
+  check-if-docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      force-docker-build: ${{ steps.changes.outputs.docker == 'true' || steps.changes.outputs.workflow == 'true' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+
+      - name: Determine if Dockerfiles changed
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: changes
+        with:
+          filters: |
+            docker:
+              - 'docker/*/Dockerfile'
+              - 'docker/build.sh'
+            workflow:
+              - '.github/workflows/docker-build.yml'
+
+  run-docker-build:
+    needs: check-if-docker-build
+    if: |
+      always() &&
+      (needs.check-if-docker-build.outputs.force-docker-build == 'true' ||
+      inputs.rebuild-docker-images == 'true' || inputs.rebuild-docker-images == true ||
+      inputs.rebuild-docker-images-call == 'true' || inputs.rebuild-docker-images-call == true)
+    uses: ./.github/workflows/docker-build.yml
+
+  # -------------------------
+  # Shard Planning (unified job outputting map for all platforms)
+  # -------------------------
+
+  shard-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      linux: ${{ steps.plan.outputs.linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+      macos: ${{ steps.plan.outputs.macos }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-key: v-35.7.5-linux-electron
+          cache-path: ~/.cache/electron
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - id: plan
+        run: |
+          # Get shard counts for all platforms as JSON
+          SHARD_JSON=$(pnpm --silent ci:test:count | tail -n1)
+
+          # Extract individual platform arrays
+          LINUX_SHARDS=$(echo "$SHARD_JSON" | jq -c '.linux')
+          WINDOWS_SHARDS=$(echo "$SHARD_JSON" | jq -c '.win32')
+          MACOS_SHARDS=$(echo "$SHARD_JSON" | jq -c '.darwin')
+
+          # Set outputs
+          echo "linux=$LINUX_SHARDS" >> $GITHUB_OUTPUT
+          echo "windows=$WINDOWS_SHARDS" >> $GITHUB_OUTPUT
+          echo "macos=$MACOS_SHARDS" >> $GITHUB_OUTPUT
+
+          # Debug output
+          echo "Planned shards:"
+          echo "  Linux: $LINUX_SHARDS"
+          echo "  Windows: $WINDOWS_SHARDS"
+          echo "  macOS: $MACOS_SHARDS"
+
+  # -------------------------
+  # Unified Test Jobs (one per OS, sharding within)
+  # -------------------------
+
+  test-linux:
+    name: Test Linux (Shard ${{ matrix.shard }})
+    needs: [check-if-docker-build, run-docker-build, shard-plan]
+    if: |
+      always() &&
+      needs.check-if-docker-build.result == 'success' &&
+      (needs.run-docker-build.result == 'success' || needs.run-docker-build.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.shard-plan.outputs.linux) }}
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+            cache-path: ~/.cache/electron
+            cache-key: v-35.7.5-linux-electron
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Cleanup runner
+        uses: ./.github/actions/cleanup-runner
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ${{ matrix.cache-path }}
+          cache-key: ${{ matrix.cache-key }}
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Download test-runner if exists
+        if: needs.run-docker-build.result == 'success'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: electron-builder-all-${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}
+          path: ${{ runner.temp }}
+
+      - name: Load test runner image if needed
+        if: needs.run-docker-build.result == 'success'
+        run: |
+          docker image load --input ${{ runner.temp }}/electron-builder-all-${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}.tar
+          docker image ls -a
+
+      - name: Run shard in docker
+        run: |
+          echo $TEST_RUNNER_IMAGE_TAG
+          pnpm test-linux
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          ADDITIONAL_DOCKER_ARGS: "-e CSC_KEY_PASSWORD=${{ secrets.WIN_CSC_KEY_PASSWORD }} -e VITEST_SHARD_INDEX=${{ matrix.shard }} -e VITEST_SMART_CACHE_FILE=./test/vitest-scripts/_vitest-smart-cache.json -e RESET_VITEST_SHARD_CACHE=${{ inputs.reset-vitest-smart-cache }}"
+          TEST_RUNNER_IMAGE_TAG: electronuserland/builder:${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}-wine-mono
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-${{ matrix.platform }}-${{ matrix.shard }}
+          path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  test-windows:
+    name: Test Windows (Shard ${{ matrix.shard }})
+    needs: shard-plan
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.shard-plan.outputs.windows) }}
+        include:
+          - platform: windows
+            runner: windows-latest
+            cache-path: ~\AppData\Local\electron\Cache
+            cache-key: v-35.7.5-windows-electron
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-key: ${{ matrix.cache-key }}
+          cache-path: ${{ matrix.cache-path }}
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Run shard
+        run: pnpm ci:test
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          VITEST_SHARD_INDEX: ${{ matrix.shard }}
+          VITEST_SMART_CACHE_FILE: ${{ github.workspace }}\test\vitest-scripts\_vitest-smart-cache.json
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-${{ matrix.platform }}-${{ matrix.shard }}
+          path: ${{ github.workspace }}\test\vitest-scripts\_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  test-macos:
+    name: Test macOS (Shard ${{ matrix.shard }})
+    needs: shard-plan
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.shard-plan.outputs.macos) }}
+        include:
+          - platform: macos
+            runner: macos-26
+            cache-path: ~/Library/Caches/electron
+            cache-key: v-35.7.5-macos-electron
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ${{ matrix.cache-path }}
+          cache-key: ${{ matrix.cache-key }}
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Install toolset via brew
+        run: |
+          brew install rpm
+
+      - name: Run shard
+        run: pnpm ci:test
+        env:
+          VITEST_SHARD_INDEX: ${{ matrix.shard }}
+          VITEST_SMART_CACHE_FILE: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          # CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-${{ matrix.platform }}-${{ matrix.shard }}
+          path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # -------------------------
+  # Special test jobs
+  # -------------------------
+
+  # Need to separate from other tests because logic is specific to when TOKEN env vars are set
+  test-updater:
+    name: Test Updater
+    needs: [check-if-docker-build, run-docker-build]
+    if: |
+      always() &&
+      needs.check-if-docker-build.result == 'success' &&
+      (needs.run-docker-build.result == 'success' || needs.run-docker-build.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Cleanup runner
+        uses: ./.github/actions/cleanup-runner
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ~/.cache/electron
+          cache-key: v-35.7.5-update-electron
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Verify Docs Generation
+        run: pnpm generate-all
+
+      - name: Download test-runner if exists
+        if: needs.run-docker-build.result == 'success'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: electron-builder-all-${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}
+          path: ${{ runner.temp }}
+
+      - name: Load test runner image if needed
+        if: needs.run-docker-build.result == 'success'
+        run: |
+          docker image load --input ${{ runner.temp }}/electron-builder-all-${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}.tar
+          docker image ls -a
+
+      - name: Test
+        run: |
+          echo $TEST_RUNNER_IMAGE_TAG
+          pnpm test-linux
+        env:
+          TEST_FILES: nsisUpdaterTest,PublishManagerTest,differentialUpdateTest,GitlabPublisherTest,GitlabPublisher.integration.test
+          TEST_RUNNER_IMAGE_TAG: electronuserland/builder:${{ env.TEST_IMAGE_NODE_MAJOR_VERSION }}-wine-mono
+          ADDITIONAL_DOCKER_ARGS: "-e KEYGEN_TOKEN=${{ secrets.KEYGEN_TOKEN }} -e BITBUCKET_TOKEN=${{ secrets.BITBUCKET_TOKEN }} -e GH_TOKEN=${{ secrets.GH_TOKEN }} -e GITLAB_TOKEN=${{ secrets.GITLAB_TOKEN }} -e VITEST_SMART_CACHE_FILE=./test/vitest-scripts/_vitest-smart-cache.json -e RESET_VITEST_SHARD_CACHE=${{ inputs.reset-vitest-smart-cache }}"
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-updater
+          path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  test-linux-native:
+    name:
+      Test Linux Native (non-Docker)
+      # disabled for now
+    if: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ~/.cache/electron
+          cache-key: v-35.7.5-native-electron
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm flatpak flatpak-builder snapd
+          sudo snap install snapcraft --classic
+
+      - name: Test
+        run: |
+          pnpm ci:test
+        env:
+          TEST_FILES: flatpakTest,snapHeavyTest
+          VITEST_SMART_CACHE_FILE: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          RESET_VITEST_SHARD_CACHE: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-linux-native
+          path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  test-e2e:
+    name: Test e2e Auto Updater Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test_config:
+          - file: dockerfile-archlinux
+            env:
+              PACKAGE_MANAGER_TO_TEST: pacman
+          - file: dockerfile-rpm
+            env:
+              PACKAGE_MANAGER_TO_TEST: dnf
+          - file: dockerfile-rpm
+            env:
+              PACKAGE_MANAGER_TO_TEST: zypper
+          - file: dockerfile-rpm
+            env:
+              PACKAGE_MANAGER_TO_TEST: yum
+          - file: dockerfile-rpm
+            env:
+              PACKAGE_MANAGER_TO_TEST: rpm
+          - file: dockerfile-debian
+            env:
+              PACKAGE_MANAGER_TO_TEST: apt
+          - file: dockerfile-debian
+            env:
+              PACKAGE_MANAGER_TO_TEST: dpkg
+          - file: dockerfile-appimage
+            env:
+              RUN_APP_IMAGE_TEST: true
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Tests
+        uses: ./.github/actions/pretest
+        with:
+          cache-path: ~/.cache/electron
+          cache-key: v-35.7.5-linux-e2e-electron
+          reset-vitest-smart-cache: ${{ inputs.reset-vitest-smart-cache }}
+
+      - name: docker build
+        run: |
+          docker build --platform=linux/amd64 -t ${{ matrix.test_config.file }} -f ./test/src/updater/${{ matrix.test_config.file }} .
+
+      - name: e2e Linux Updater tests (install, auto-update, uninstall)
+        run: |
+          pnpm test-linux
+        env:
+          TEST_RUNNER_IMAGE_TAG: ${{ matrix.test_config.file }}
+          TEST_FILES: blackboxUpdateTest,linuxUpdaterTest
+          DEBUG: electron-updater,electron-builder
+          ADDITIONAL_DOCKER_ARGS: "-e PACKAGE_MANAGER_TO_TEST=${{ matrix.test_config.env.PACKAGE_MANAGER_TO_TEST }} -e RUN_APP_IMAGE_TEST=${{ matrix.test_config.env.RUN_APP_IMAGE_TEST || false }} -e VITEST_SMART_CACHE_FILE=./test/vitest-scripts/_vitest-smart-cache.json -e RESET_VITEST_SHARD_CACHE=${{ inputs.reset-vitest-smart-cache }}"
+
+      - name: Upload smart cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: vitest-smart-cache-e2e-${{ matrix.test_config.env.PACKAGE_MANAGER_TO_TEST }}
+          path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # -------------------------
+  # Merge Smart Cache Artifacts
+  # -------------------------
+
+  merge-smart-cache:
+    needs: [test-linux, test-windows, test-macos, test-e2e, test-updater, test-linux-native]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/pnpm
+
+      - name: Download all smart cache artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: vitest-smart-cache-*
+          path: smart-cache-artifacts
+        continue-on-error: true
+
+      - name: Merge cache files
+        run: |
+          mkdir -p merged-cache
+
+          # Create merge script
+          cat > merge-caches.js << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+
+          const artifactsDir = 'smart-cache-artifacts';
+          const outputFile = 'merged-cache/_vitest-smart-cache.json';
+          const repoCommittedCache = 'test/vitest-scripts/_vitest-smart-cache.json';
+
+          let mergedCache = {};
+          let filesProcessed = 0;
+
+          // Start with repo-committed cache as base (if it exists)
+          if (fs.existsSync(repoCommittedCache)) {
+            console.log('Loading base cache from repo-committed file');
+            try {
+              mergedCache = JSON.parse(fs.readFileSync(repoCommittedCache, 'utf8'));
+              console.log(`Base cache has ${Object.keys(mergedCache).length} entries`);
+            } catch (err) {
+              console.error('Error reading repo-committed cache:', err.message);
+            }
+          }
+
+          // Check if artifacts directory exists
+          if (!fs.existsSync(artifactsDir)) {
+            console.log('No smart cache artifacts found to merge, using base cache only');
+            fs.writeFileSync(outputFile, JSON.stringify(mergedCache, null, 2));
+            process.exit(0);
+          }
+
+          // Read all cache files from test runs
+          const platforms = fs.readdirSync(artifactsDir);
+
+          platforms.forEach(platform => {
+            const cacheFile = path.join(artifactsDir, platform, '_vitest-smart-cache.json');
+            if (fs.existsSync(cacheFile)) {
+              console.log(`Reading cache from ${platform}`);
+              try {
+                const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+                filesProcessed++;
+
+                // Merge cache entries (later entries overwrite earlier ones, should be fine since they are all from the same test run just different shards and adding on to previous data)
+                Object.keys(cache).forEach(key => {
+                  mergedCache[key] = cache[key];
+                });
+              } catch (err) {
+                console.error(`Error reading cache from ${platform}:`, err.message);
+              }
+            }
+          });
+
+          console.log(`Processed ${filesProcessed} cache files from test runs`);
+          console.log(`Final merged cache has ${Object.keys(mergedCache).length} entries`);
+          fs.writeFileSync(outputFile, JSON.stringify(mergedCache, null, 2));
+          EOF
+
+          node merge-caches.js
+
+      - name: Delete individual cache artifacts
+        uses: geekyeggo/delete-artifact@f275313e70c08f6120db482d7a6b98377786765b # v5.1.0
+        with:
+          name: vitest-smart-cache-*
+          failOnError: false
+
+      - name: Upload merged cache artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: vitest-smart-cache-merged
+          path: merged-cache/_vitest-smart-cache.json
+          retention-days: 2
+
+      - name: Save merged cache for future runs on this branch
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: merged-cache/_vitest-smart-cache.json
+          key: vitest-smart-cache-${{ github.ref_name }}-${{ github.sha }}
+

@@ -1,0 +1,33 @@
+name: 'pnpm installation'
+description: 'Enable via corepack and install dependencies'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Enable Corepack for pnpm
+      run: |
+        corepack enable
+        corepack prepare pnpm@10.18.0 --activate
+      shell: bash
+
+    - name: Setup node
+      uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+      with:
+        node-version: '22'
+        cache: 'pnpm'
+
+    - name: Update npm to support OIDC token authentication for publishing
+      run: npm install -g npm@11.6.2
+      shell: bash
+
+    - name: Verify updated npm version
+      run: npm -v
+      shell: bash
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+      shell: bash
+
+## Usage
+# - name: corepack and install dependencies
+#   uses: ./.github/actions/pnpm

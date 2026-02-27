@@ -1,0 +1,31 @@
+FROM fedora:42
+
+RUN dnf install -y \
+    libxcrypt-compat \
+    nodejs \
+    npm \
+    rpm-build \
+    libXScrnSaver \
+    libX11-devel \
+    alsa-lib \
+    git \
+    gcc-c++ \
+    make \
+    libuuid \
+    libuuid-devel \
+    python3 \
+    curl \
+    xz \
+    zypper \
+    at-spi2-core \
+    liberation-fonts \
+    fontconfig \
+    gtk3 \
+    xdg-utils \
+    xorg-x11-server-Xvfb \
+    && dnf clean all
+
+RUN npm --silent install --global --depth 0 pnpm corepack \
+ && corepack enable
+
+WORKDIR /project

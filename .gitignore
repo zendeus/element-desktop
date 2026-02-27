@@ -19,3 +19,5 @@ yarn-error.log
 /scripts/hak/**/*.js
 .DS_Store
 /playwright-report
+
+.pnpm-store

@@ -57,7 +57,7 @@
         "test:open": "pnpm test --ui",
         "test:screenshots:build": "docker build playwright -t element-desktop-playwright --platform linux/amd64",
         "test:screenshots:run": "docker run --rm --network host -v $(pwd):/work/element-desktop -v element-desktop-playwright:/work/element-desktop/node_modules -v /var/run/docker.sock:/var/run/docker.sock --platform linux/amd64 -it element-desktop-playwright",
-        "postinstall": "electron-builder install-app-deps"
+        "postinstall": "cd electron-builder && pnpm i && pnpm compile && cd .. && electron-builder install-app-deps"
     },
     "dependencies": {
         "@sentry/electron": "^7.0.0",
@@ -136,6 +136,16 @@
         },
         "allowedDeprecatedVersions": {
             "eslint": "8"
+        },
+        "overrides": {
+            "atomically": "2.1.1",
+            "@types/node": "18.19.130",
+            "config-file-ts": "0.2.8-rc1",
+            "node-abi": "4.26.0",
+            "@types/pg-pool": "2.0.7",
+            "electron-builder": "link:electron-builder/packages/electron-builder",
+            "electron-builder-squirrel-windows": "link:electron-builder/packages/electron-builder-squirrel-windows",
+            "app-builder-lib": "link:electron-builder/packages/app-builder-lib"
         }
     },
     "packageManager": "pnpm@10.30.0+sha512.2b5753de015d480eeb88f5b5b61e0051f05b4301808a82ec8b840c9d2adf7748eb352c83f5c1593ca703ff1017295bc3fdd3119abb9686efc96b9fcb18200937"

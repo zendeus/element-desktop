@@ -1,0 +1,61 @@
+name: 'Setup Tests'
+description: 'Set up pnpm, node w/ pnpm cache, install deps, compile, and restore electron cache'
+inputs:
+  cache-key:
+    description: 'The key to the electron cache'
+    required: true
+  cache-path:
+    description: 'The path to the electron cache'
+    required: true
+  reset-vitest-smart-cache:
+    description: "Reset Vitest smart cache (will cause all tests to run without caching for this run, then cache will be repopulated for future runs)"
+    required: false
+    type: boolean
+    default: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup PNPM and install dependencies
+      uses: ./.github/actions/pnpm
+
+    - name: Compile
+      run: pnpm compile
+      shell: bash
+
+    - name: Cache Electron
+      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: ${{ inputs.cache-path }}
+        key: ${{ inputs.cache-key }}
+
+    - name: Restore Vitest Smart Cache
+      id: cache-restore
+      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: ${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json
+        key: vitest-smart-cache-${{ github.ref_name }}-${{ github.sha }}
+        restore-keys: |
+          vitest-smart-cache-${{ github.ref_name }}-
+
+    - name: Set up Vitest smart cache reset flag
+      run: echo "RESET_VITEST_SHARD_CACHE=${{ inputs.reset-vitest-smart-cache }}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Log cache status
+      run: |
+        if [ "${{ steps.cache-restore.outputs.cache-hit }}" == "true" ]; then
+          echo "✓ Restored smart cache from previous run"
+        elif [ -f "${{ github.workspace }}/test/vitest-scripts/_vitest-smart-cache.json" ]; then
+          echo "✓ Using repo-committed smart cache file"
+        else
+          echo "ℹ No smart cache available (will be created after test run)"
+        fi
+      shell: bash
+
+## Usage
+# - name: Setup Tests
+#   uses: ./.github/actions/pretest
+#   with:
+#     cache-path: ~/Library/Caches/electron
+#     cache-key: v-35.7.5-macos-electron
