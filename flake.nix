@@ -13,7 +13,34 @@
       });
     in
     {
-      devShells = forEachSupportedSystem ({ pkgs }: {
+      devShells = forEachSupportedSystem ({ pkgs }: let
+        isLinux = pkgs.stdenv.hostPlatform.isLinux;
+        electronDeps = with pkgs; pkgs.lib.optionals isLinux [
+          glib
+          nss
+          nspr
+          dbus
+          atk
+          cups
+          cairo
+          gtk3
+          pango
+          xorg.libX11
+          xorg.libXcomposite
+          xorg.libXdamage
+          xorg.libXext
+          xorg.libXfixes
+          xorg.libXrandr
+          libgbm
+          mesa
+          expat
+          xorg.libxcb
+          libxkbcommon
+          udev
+          alsa-lib
+          at-spi2-atk
+        ];
+      in {
         default = pkgs.mkShell {
           packages = with pkgs; [
             node2nix
@@ -21,6 +48,8 @@
             pnpm
             yarn
           ];
+          buildInputs = electronDeps;
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath electronDeps;
         };
       });
     };
